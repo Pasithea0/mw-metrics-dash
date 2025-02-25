@@ -31,6 +31,13 @@ const errorTitles = [
   "Quick heads up:",
 ];
 
+const urlSuggestions = {
+  protocols: ["https://", "http://"],
+  subdomains: ["server.", "api.", "staging.", "www."],
+  tlds: [".com", ".net", ".org", ".io", ".co", ".dev"],
+  paths: ["/metrics"],
+};
+
 interface MetricsFormProps {
   onSubmit: (url: string) => void;
   isLoading: boolean;
@@ -49,6 +56,9 @@ export function MetricsForm({
   const { toast } = useToast();
   const [localLoading, setLocalLoading] = useState(false);
   const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -57,7 +67,6 @@ export function MetricsForm({
     },
   });
 
-  // Auto-refresh effect
   useEffect(() => {
     if (refreshIntervalRef.current) {
       clearInterval(refreshIntervalRef.current);
@@ -66,24 +75,98 @@ export function MetricsForm({
 
     if (autoRefresh && form.getValues().url) {
       const url = form.getValues().url;
-
       if (formSchema.shape.url.safeParse(url).success) {
         refreshIntervalRef.current = setInterval(() => {
           if (!isLoading && !localLoading) {
             handleSubmit(form.getValues());
           }
-        }, 10000); // 10 seconds
+        }, 10000);
       }
     }
 
-    // Cleanup interval on unmount or when dependencies change
     return () => {
       if (refreshIntervalRef.current) {
         clearInterval(refreshIntervalRef.current);
-        refreshIntervalRef.current = null;
       }
     };
   }, [autoRefresh, isLoading, localLoading, form.getValues().url]);
+
+  const updateSuggestions = (input: string) => {
+    let newSuggestions: string[] = [];
+
+    if (!input) {
+      newSuggestions = urlSuggestions.protocols;
+    } else if (!input.startsWith("http")) {
+      newSuggestions = urlSuggestions.protocols.filter((p) =>
+        p.startsWith(input)
+      );
+    } else {
+      const protocol = input.startsWith("https://") ? "https://" : "http://";
+      const rest = input.slice(protocol.length);
+
+      if (rest.includes("/")) {
+        const pathPart = rest.split("/").pop() || "";
+        newSuggestions = urlSuggestions.paths
+          .filter((p) => p.startsWith(`/${pathPart}`))
+          .map((p) => p.slice(pathPart.length));
+      } else {
+        const domainParts = rest.split(".");
+        const lastPart = domainParts[domainParts.length - 1];
+
+        if (input.endsWith(".")) {
+          newSuggestions = urlSuggestions.tlds;
+        } else if (domainParts.length === 1) {
+          const subMatches = urlSuggestions.subdomains.filter((s) =>
+            s.startsWith(rest)
+          );
+          newSuggestions =
+            subMatches.length > 0 ? subMatches : urlSuggestions.tlds;
+        } else {
+          newSuggestions = urlSuggestions.tlds
+            .filter((tld) => tld.startsWith(`.${lastPart}`))
+            .map((tld) => tld.slice(lastPart.length));
+        }
+      }
+    }
+
+    setSuggestions(newSuggestions.slice(0, 5));
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value;
+    form.setValue("url", value);
+    updateSuggestions(value);
+    setShowSuggestions(true);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Tab" && suggestions.length > 0 && showSuggestions) {
+      e.preventDefault();
+      const currentValue = form.getValues().url;
+      form.setValue("url", currentValue + suggestions[0]);
+      setShowSuggestions(false);
+    } else if (e.key === "Escape") {
+      setShowSuggestions(false);
+    }
+  };
+
+  const handleSuggestionClick = (suggestion: string) => {
+    const currentValue = form.getValues().url;
+    form.setValue("url", currentValue + suggestion);
+    setShowSuggestions(false);
+    inputRef.current?.focus();
+  };
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (inputRef.current && !inputRef.current.contains(e.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   const getRandomErrorTitle = () => {
     const randomIndex = Math.floor(Math.random() * errorTitles.length);
@@ -91,78 +174,44 @@ export function MetricsForm({
   };
 
   const checkUrlAvailability = async (url: string): Promise<boolean> => {
-    const headers = {
-      Accept: "text/plain",
-      "User-Agent": "Mozilla/5.0 (compatible; MetricsFetcher/1.0)",
-    };
-
+    const headers = { Accept: "text/plain" };
     try {
-      let response: Response | null = null;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // ⏳ 15-second timeout
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      let response = await fetch(url, {
+        method: "HEAD",
+        headers,
+        signal: controller.signal,
+      });
 
-      try {
-        response = await fetch(url, {
-          method: "HEAD",
-          headers,
-          signal: controller.signal,
-        });
-      } catch (err) {
-        console.warn(`HEAD request failed, falling back to GET for: ${url}`);
-      }
-
-      if (!response || !response.ok) {
-        response = await fetch(url, {
-          method: "GET",
-          headers,
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error(
-            `Failed to fetch "${url}" (Status: ${response.status})`
-          );
-        }
-      }
+      if (!response.ok)
+        throw new Error(`HEAD request failed (${response.status})`);
 
       clearTimeout(timeoutId);
-
       const contentType = response.headers.get("content-type");
       if (!contentType?.includes("text/plain")) {
-        throw new Error(
-          `Invalid metrics endpoint: "${url}" does not return text/plain content`
-        );
+        throw new Error("Invalid content type (expected text/plain)");
       }
-
       return true;
     } catch (error) {
       if (error instanceof Error) {
-        if (error.name === "AbortError") {
-          toast({
-            variant: "destructive",
-            title: getRandomErrorTitle(),
-            description: `Connection timed out while trying to reach "${url}". The server might be slow or unreachable.`,
-          });
-        } else {
-          toast({
-            variant: "destructive",
-            title: getRandomErrorTitle(),
-            description: error.message,
-          });
-        }
+        toast({
+          variant: "destructive",
+          title: getRandomErrorTitle(),
+          description: error.message.includes("AbortError")
+            ? `Timeout reaching ${url}`
+            : error.message,
+        });
       }
       return false;
     }
   };
 
   const handleSubmit = async (data: z.infer<typeof formSchema>) => {
-    setLocalLoading(true); // Almost instantly toggle the loading state.
+    setLocalLoading(true);
     const isAvailable = await checkUrlAvailability(data.url);
-    if (isAvailable) {
-      onSubmit(data.url);
-    }
-
-    setLocalLoading(false); // Resets the loading state after request.
+    if (isAvailable) onSubmit(data.url);
+    setLocalLoading(false);
   };
 
   return (
@@ -177,15 +226,44 @@ export function MetricsForm({
               control={form.control}
               name="url"
               render={({ field }) => (
-                <FormItem className="flex-1">
+                <FormItem className="flex-1 relative">
                   <FormLabel>Metrics URL:</FormLabel>
                   <FormControl>
                     <Input
                       placeholder="https://your-server/metrics"
                       {...field}
+                      ref={inputRef}
+                      onChange={handleInputChange}
+                      onKeyDown={handleKeyDown}
+                      onFocus={() => {
+                        updateSuggestions(field.value);
+                        setShowSuggestions(true);
+                      }}
                       className="w-full rounded-xl"
                     />
                   </FormControl>
+                  {showSuggestions && suggestions.length > 0 && (
+                    <div className="absolute z-[999] mt-1 w-full max-h-60 overflow-auto bg-black dark:bg-gray-800 rounded-md shadow-lg border border-gray-700">
+                      <ul className="py-1">
+                        {suggestions.map((suggestion, index) => (
+                          <li
+                            key={index}
+                            className={`px-4 py-2 text-sm cursor-pointer hover:bg-gray-900 dark:hover:bg-gray-700 ${
+                              index === 0 ? "bg-gray-800 dark:bg-gray-700" : ""
+                            }`}
+                            onClick={() => handleSuggestionClick(suggestion)}
+                          >
+                            {suggestion}
+                            {index === 0 && (
+                              <span className="float-right text-xs text-gray-500">
+                                Press Tab to complete
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                 </FormItem>
               )}
             />
@@ -195,7 +273,7 @@ export function MetricsForm({
                 disabled={isLoading || localLoading}
                 className="rounded-xl hover:bg-[#4A89F3] lg:w-[150px]"
               >
-                {localLoading ? "Fetching..." : "Fetch Metrics"}{" "}
+                {localLoading ? "Fetching..." : "Fetch Metrics"}
               </Button>
               <Button
                 type="button"
